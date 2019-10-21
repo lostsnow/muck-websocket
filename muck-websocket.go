@@ -1,50 +1,37 @@
 package main
 
 import (
-	"crypto/tls"
+	"bufio"
+	"bytes"
 	"flag"
 	"log"
-	"net"
+	"io/ioutil"
 	"net/http"
-	"strings"
 	"sync"
 
-	"github.com/Cristofori/kmud/telnet"
+	"github.com/tehbilly/gmudc/telnet"
 	"github.com/gorilla/websocket"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // Flags
 var addr = flag.String("addr", "localhost:8000", "http service address")
 var muckHost = flag.String("muck", "localhost:4021",
 	"host and port for proxied muck")
-var useTLS = flag.Bool("muck-ssl", false,
-	"whether to connect to the muck with SSL.")
-
-// Telnet commands
-const FORWARDED = 113 // The new telnet option constant.
-var willForwardCmd = telnet.BuildCommand(telnet.WILL, FORWARDED)
-var beginForwardCmd = telnet.BuildCommand(telnet.SB, FORWARDED)
-var endForwardCmd = telnet.BuildCommand(telnet.SE)
+var isGBK = flag.Bool("gbk", false,
+	"is muck charset GBK.")
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-func openTelnet() (t *telnet.Telnet, err error) {
-	var conn net.Conn
+func openTelnet() (*telnet.Connection, error) {
+	conn := telnet.New()
 
-	if *useTLS {
-		conn, err = tls.Dial("tcp", *muckHost, &tls.Config{
-			InsecureSkipVerify: true,
-		})
-	} else {
-		conn, err = net.Dial("tcp", *muckHost)
-	}
-	if err != nil {
-		return nil, err
-	}
+	err := conn.Dial("tcp", *muckHost)
 
-	return telnet.NewTelnet(conn), nil
+	return conn, err
 }
 
 func telnetProxy(w http.ResponseWriter, r *http.Request) {
@@ -72,18 +59,6 @@ func telnetProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer t.Close()
 
-	// Send over codes containing the user's real ip.
-	// 1. Indicate our intention.
-	t.SendCommand(telnet.WILL)
-	t.Write([]byte{FORWARDED})
-	// TODO: Use a listener function to confirm whether or not the server supports forwarding.
-	// 2. Negotiate the start of the suboption transmission.
-	t.SendCommand(telnet.SB)
-	t.Write([]byte{FORWARDED})
-	// 3. Send our new hostname.
-	t.Write([]byte(strings.Split(r.RemoteAddr, ":")[0]))
-	// 4. Indicate that we are done sending.
-	t.SendCommand(telnet.SE)
 	log.Printf("Connection open for '%s'. Proxying.", r.RemoteAddr)
 
 	var wg sync.WaitGroup
@@ -94,13 +69,22 @@ func telnetProxy(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer once.Do(func() { wg.Done() })
 		for {
-			_, bytes, err := c.ReadMessage()
+			_, bs, err := c.ReadMessage()
 			if err != nil {
 				log.Printf("Error reading from ws(%s): %v", r.RemoteAddr, err)
 				break
 			}
+
+			if *isGBK == true {
+				bs, err = utf8ToGbk(bs)
+				if err != nil {
+					log.Printf("Error convert encoding")
+					break
+				}
+			}
+
 			// TODO: Partial writes.
-			if _, err := t.Write(bytes); err != nil {
+			if _, err := t.Write(bs); err != nil {
 				log.Printf("Error sending message to Muck for %s: %v",
 					r.RemoteAddr, err)
 				break
@@ -111,14 +95,23 @@ func telnetProxy(w http.ResponseWriter, r *http.Request) {
 	// Send messages from the MUCK to the websocket.
 	go func() {
 		defer once.Do(func() { wg.Done() })
+		br := bufio.NewReader(t)
 		for {
-			bytes := make([]byte, 1024)
-			if _, err := t.Read(bytes); err != nil {
-				log.Printf("Error reading from muck for %s: %v",
-					r.Host, err)
+			bs := make([]byte, 1024)
+			if _, err := br.Read(bs); err != nil {
+				log.Printf("Error reading from muck for %s: %v", r.Host, err)
 				break
 			}
-			if err := c.WriteMessage(websocket.TextMessage, bytes); err != nil {
+
+			if *isGBK == true {
+				bs, err = gbkToUtf8(bs)
+				if err != nil {
+					log.Printf("Error convert encoding")
+					break
+				}
+			}
+
+			if err = c.WriteMessage(websocket.TextMessage, bs); err != nil {
 				log.Printf("Error sending to ws(%s): %v", r.RemoteAddr, err)
 				break
 			}
@@ -128,6 +121,16 @@ func telnetProxy(w http.ResponseWriter, r *http.Request) {
 	// Wait until either go routine exits and then close both connections.
 	wg.Wait()
 	log.Printf("Proxying completed for %s", r.RemoteAddr)
+}
+
+func gbkToUtf8(s []byte) ([]byte, error) {
+    reader := transform.NewReader(bytes.NewReader(s), simplifiedchinese.GBK.NewDecoder())
+    return ioutil.ReadAll(reader)
+}
+
+func utf8ToGbk(s []byte) ([]byte, error) {
+	reader := transform.NewReader(bytes.NewReader(s), simplifiedchinese.GBK.NewEncoder())
+	return ioutil.ReadAll(reader)
 }
 
 func main() {
